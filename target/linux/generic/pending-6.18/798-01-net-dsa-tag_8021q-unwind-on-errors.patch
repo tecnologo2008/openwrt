@@ -1,0 +1,81 @@
+From: GL.iNet Test Build <support@gl-inet.com>
+Subject: [PATCH] net: dsa: tag_8021q: unwind partial setup on errors
+
+Three error paths in the shared tag_8021q code leave state behind. This
+code is used by every tag_8021q based driver, so the change is split
+out of the RTL8366UB driver patch. Only failure paths change; the
+success paths are untouched.
+
+- dsa_switch_tag_8021q_vlan_add() returned on the first port that failed
+  and left the VID installed on the ports handled before it. Remove it
+  from those ports again before returning the error.
+- dsa_tag_8021q_setup() returned on the first port that failed and left
+  the earlier ports configured. Tear those ports down again.
+- dsa_tag_8021q_register() freed the context on its error path but left
+  ds->tag_8021q_ctx pointing at it.
+
+---
+diff --git a/net/dsa/tag_8021q.c b/net/dsa/tag_8021q.c
+index 53e03fd80..ac84ba0ac 100644
+--- a/net/dsa/tag_8021q.c
++++ b/net/dsa/tag_8021q.c
+@@ -217,7 +217,7 @@ dsa_port_tag_8021q_vlan_match(struct dsa_port *dp,
+ int dsa_switch_tag_8021q_vlan_add(struct dsa_switch *ds,
+ 				  struct dsa_notifier_tag_8021q_vlan_info *info)
+ {
+-	struct dsa_port *dp;
++	struct dsa_port *dp, *rollback_dp;
+ 	int err;
+ 
+ 	/* Since we use dsa_broadcast(), there might be other switches in other
+@@ -239,11 +239,22 @@ int dsa_switch_tag_8021q_vlan_add(struct dsa_switch *ds,
+ 			err = dsa_port_do_tag_8021q_vlan_add(dp, info->vid,
+ 							     flags);
+ 			if (err)
+-				return err;
++				goto rollback;
+ 		}
+ 	}
+ 
+ 	return 0;
++
++rollback:
++	dsa_switch_for_each_port(rollback_dp, ds) {
++		if (rollback_dp == dp)
++			break;
++
++		if (dsa_port_tag_8021q_vlan_match(rollback_dp, info))
++			dsa_port_do_tag_8021q_vlan_del(rollback_dp, info->vid);
++	}
++
++	return err;
+ }
+ 
+ int dsa_switch_tag_8021q_vlan_del(struct dsa_switch *ds,
+@@ -398,11 +409,17 @@ static int dsa_tag_8021q_setup(struct dsa_switch *ds)
+ 			dev_err(ds->dev,
+ 				"Failed to setup VLAN tagging for port %d: %pe\n",
+ 				port, ERR_PTR(err));
+-			return err;
++			goto teardown;
+ 		}
+ 	}
+ 
+ 	return 0;
++
++teardown:
++	while (port--)
++		dsa_tag_8021q_port_teardown(ds, port);
++
++	return err;
+ }
+ 
+ static void dsa_tag_8021q_teardown(struct dsa_switch *ds)
+@@ -438,6 +455,7 @@ int dsa_tag_8021q_register(struct dsa_switch *ds, __be16 proto)
+ 	return 0;
+ 
+ err_free:
++	ds->tag_8021q_ctx = NULL;
+ 	kfree(ctx);
+ 	return err;
+ }
